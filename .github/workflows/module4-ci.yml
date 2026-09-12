@@ -1,0 +1,49 @@
+name: Module 4 CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile Python sources
+        run: python -m compileall -q app.py app runtime
+
+      - name: Ensure local secret files are not tracked
+        shell: bash
+        run: |
+          if git ls-files | grep -E '(^|/)\.env$|(^|/)\.streamlit/secrets\.toml$'; then
+            echo "A local secret file is tracked by Git."
+            exit 1
+          fi
+
+      - name: Guard example file against common live token prefixes
+        shell: bash
+        run: |
+          if grep -E 'OPENROUTER_API_KEY=sk-or-v1-|KAGGLE_API_TOKEN=KGAT_|HF_TOKEN=hf_[A-Za-z0-9]{10,}' .env.example; then
+            echo ".env.example appears to contain a live credential."
+            exit 1
+          fi
+
+      - name: Check deployment files
+        shell: bash
+        run: |
+          test -f requirements.txt
+          test -f app.py
+          test -f Dockerfile

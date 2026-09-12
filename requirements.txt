@@ -1,0 +1,13 @@
+streamlit>=1.60,<1.61
+openai>=2.5
+python-dotenv
+requests
+psutil
+numpy
+pandas
+faiss-cpu
+sentence-transformers
+kagglehub
+duckdb
+fastmcp
+huggingface_hub
