@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,15 @@ _metadata_shards: list[Path] | None = None
 _resolved_index_path: Path | None = None
 
 _resolved_metadata_dir: Path | None = None
+
+# Deployment hardening:
+# serialize one-time heavy initialization inside a single
+# Cloud Run / Streamlit Python process. These locks do not
+# alter retrieval behaviour; they prevent concurrent sessions
+# from racing through asset download, model load, or FAISS load.
+_RAG_ASSET_LOCK = threading.RLock()
+_RAG_EMBEDDING_LOCK = threading.Lock()
+_RAG_FAISS_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -254,9 +264,35 @@ def _download_kaggle_dataset(
     """
     Download or resolve a cached Kaggle dataset.
 
-    Authentication is expected to be supplied externally,
-    normally through KAGGLE_API_TOKEN.
+    Deployment hardening:
+    - explicitly read KAGGLE_API_TOKEN from the runtime environment
+    - validate presence / expected token prefix
+    - normalize the value back into os.environ before importing
+      and calling KaggleHub
+
+    The token value is never logged or returned.
     """
+
+    kaggle_token = os.getenv(
+        "KAGGLE_API_TOKEN",
+        "",
+    ).strip()
+
+    if not kaggle_token:
+        raise RuntimeError(
+            "KAGGLE_API_TOKEN is not available in the "
+            "runtime environment."
+        )
+
+    if not kaggle_token.startswith("KGAT_"):
+        raise RuntimeError(
+            "KAGGLE_API_TOKEN is present but has an "
+            "unexpected format."
+        )
+
+    # Ensure KaggleHub sees the exact normalized token value
+    # in the current process environment.
+    os.environ["KAGGLE_API_TOKEN"] = kaggle_token
 
     kagglehub = _import_kagglehub()
 
@@ -269,8 +305,8 @@ def _download_kaggle_dataset(
         raise RuntimeError(
             "Unable to access Kaggle dataset "
             f"'{dataset_handle}'. "
-            "Ensure KAGGLE_API_TOKEN is configured "
-            "and the account has access to the dataset."
+            "KAGGLE_API_TOKEN is present and structurally valid; "
+            "verify runtime authentication and dataset access."
         ) from exc
 
     path = Path(
@@ -290,7 +326,7 @@ def _download_kaggle_dataset(
 # ASSET RESOLUTION
 # ============================================================
 
-def resolve_rag_assets(
+def _resolve_rag_assets_unlocked(
     force_refresh: bool = False,
 ) -> dict[str, Any]:
     """
@@ -476,6 +512,22 @@ def resolve_rag_assets(
     }
 
 
+def resolve_rag_assets(
+    force_refresh: bool = False,
+) -> dict[str, Any]:
+    """
+    Thread-safe wrapper around deployment asset resolution.
+
+    Only one Streamlit session may resolve/download the heavy
+    Kaggle-backed RAG assets at a time. Other sessions wait for
+    the same local cache to become ready.
+    """
+    with _RAG_ASSET_LOCK:
+        return _resolve_rag_assets_unlocked(
+            force_refresh=force_refresh,
+        )
+
+
 # ============================================================
 # METADATA SHARD REGISTRY
 # ============================================================
@@ -502,7 +554,7 @@ def get_metadata_shards() -> list[Path]:
 # EMBEDDING MODEL
 # ============================================================
 
-def get_embedding_model():
+def _get_embedding_model_unlocked():
     """
     Lazy-load the validated BGE-M3 embedding model.
     """
@@ -529,11 +581,30 @@ def get_embedding_model():
     return _embedding_model
 
 
+def get_embedding_model():
+    """
+    Thread-safe BGE-M3 lazy loader.
+
+    Prevents two concurrent Streamlit sessions from loading a
+    second copy of the embedding model into memory.
+    """
+    global _embedding_model
+
+    if _embedding_model is not None:
+        return _embedding_model
+
+    with _RAG_EMBEDDING_LOCK:
+        if _embedding_model is not None:
+            return _embedding_model
+
+        return _get_embedding_model_unlocked()
+
+
 # ============================================================
 # FAISS INDEX
 # ============================================================
 
-def get_faiss_index():
+def _get_faiss_index_unlocked():
     """
     Lazy-load the validated FAISS IndexFlatIP index.
     """
@@ -574,6 +645,25 @@ def get_faiss_index():
     _faiss_index = index
 
     return _faiss_index
+
+
+def get_faiss_index():
+    """
+    Thread-safe FAISS lazy loader.
+
+    Prevents duplicate ~multi-GB index loads when more than one
+    Streamlit session reaches RAG during cold initialization.
+    """
+    global _faiss_index
+
+    if _faiss_index is not None:
+        return _faiss_index
+
+    with _RAG_FAISS_LOCK:
+        if _faiss_index is not None:
+            return _faiss_index
+
+        return _get_faiss_index_unlocked()
 
 
 # ============================================================
