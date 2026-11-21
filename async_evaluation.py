@@ -122,7 +122,7 @@ def job_status(job_id, capability):
 
 def verify_task_oidc(header):
     """Verify Cloud Tasks' Google-signed bearer token before reading any job."""
-    if not enabled() or not isinstance(header, str) or not header.startswith("Bearer "):
+    if not enabled() or not isinstance(header, str) or len(header)>4096 or not header.startswith("Bearer "):
         return False
     from google.oauth2 import id_token
     from google.auth.transport import requests
