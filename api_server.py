@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import threading
+import time
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 
 from api_adapter import public_result,validate_question
@@ -41,10 +42,16 @@ def prewarm():
 
 
 def run_three_systems(question:str,include_evaluation:bool):
+    # The original comparison timing does NOT include the optional Granite judges.
+    # Measure the entire API experiment separately without altering the engine.
+    started=time.perf_counter()
     from runtime.comparison import run_three_path_experiment
     r=asyncio.run(run_three_path_experiment(question))
+    three_path_s=round(time.perf_counter()-started,3)
     evaluation=None
+    evaluation_s=None
     if include_evaluation:
+        evaluation_started=time.perf_counter()
         from runtime.evaluation_threeway import (
             evaluate_three_way_telecom,run_three_way_quality_judge)
         paths=r["paths"]
@@ -77,7 +84,15 @@ def run_three_systems(question:str,include_evaluation:bool):
                     ("llm_only","answer_a"),("strict","answer_b"),("augmented","answer_c"))},
                 "comparison_summary":v.get("comparison_summary"),
                 "question_intent":v.get("question_intent")}
-    return public_result(r,evaluation)
+    if include_evaluation:
+        evaluation_s=round(time.perf_counter()-evaluation_started,3)
+    output=public_result(r,evaluation)
+    output["timing"].update({
+        "api_total_wall_s":round(time.perf_counter()-started,3),
+        "three_path_api_wall_s":three_path_s,
+        "evaluation_wall_s":evaluation_s,
+    })
+    return output
 
 
 class Handler(BaseHTTPRequestHandler):
