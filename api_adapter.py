@@ -62,29 +62,32 @@ def safe_evaluation(raw:dict[str,Any]|None):
             "comparison_summary":bounded(raw.get("comparison_summary"),700),
             "question_intent":bounded(raw.get("question_intent"),300)}
 
+def public_path(path:dict[str,Any],key:str):
+    """The same bounded projection is used by both streaming and JSON routes."""
+    if key not in PATHS or not isinstance(path,dict):
+        raise ValueError("Invalid original system.")
+    m=path.get("metadata") if isinstance(path.get("metadata"),dict) else {}
+    value=path.get("result") if isinstance(path.get("result"),dict) else {}
+    answer=bounded(value.get("answer"),12000)
+    if not answer:raise ValueError("Original "+key+" path returned no answer.")
+    timing=path.get("timing") if isinstance(path.get("timing"),dict) else {}
+    return {
+        "answer":answer,
+        "title":bounded(m.get("name"),65),
+        "mode":bounded(m.get("mode"),60),
+        "objective":bounded(m.get("objective"),120),
+        "policy":bounded(m.get("policy"),170),
+        "sources":safe_sources(value),
+        "orchestration_path":safe_trace(path.get("orchestration_path") or value.get("orchestration_path")),
+        "elapsed_s":number(timing.get("total_wall_s")),
+        "source_families":[bounded(x,75) for x in (m.get("sources") or [])[:7] if isinstance(x,str)],
+    }
+
 def public_result(result:dict[str,Any],evaluation:dict[str,Any]|None=None):
     paths=result.get("paths") or {}
     if not all(isinstance(paths.get(k),dict) for k in PATHS):
         raise ValueError("Three-path inference was incomplete.")
-    safe={}
-    for key in PATHS:
-        path=paths[key]
-        m=path.get("metadata") if isinstance(path.get("metadata"),dict) else {}
-        value=path.get("result") if isinstance(path.get("result"),dict) else {}
-        answer=bounded(value.get("answer"),12000)
-        if not answer:raise ValueError("Original "+key+" path returned no answer.")
-        timing=path.get("timing") if isinstance(path.get("timing"),dict) else {}
-        safe[key]={
-            "answer":answer,
-            "title":bounded(m.get("name"),65),
-            "mode":bounded(m.get("mode"),60),
-            "objective":bounded(m.get("objective"),120),
-            "policy":bounded(m.get("policy"),170),
-            "sources":safe_sources(value),
-            "orchestration_path":safe_trace(path.get("orchestration_path") or value.get("orchestration_path")),
-            "elapsed_s":number(timing.get("total_wall_s")),
-            "source_families":[bounded(x,75) for x in (m.get("sources") or [])[:7] if isinstance(x,str)],
-        }
+    safe={key:public_path(paths[key],key) for key in PATHS}
     timing=result.get("timing") if isinstance(result.get("timing"),dict) else {}
     routing=result.get("routing") if isinstance(result.get("routing"),dict) else {}
     return {"ok":True,"schema_version":SCHEMA_VERSION,
