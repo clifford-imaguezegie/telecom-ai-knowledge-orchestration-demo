@@ -26,9 +26,10 @@ class NativeAPIContractTests(unittest.TestCase):
         cls.httpd.server_close()
         cls.thread.join(timeout=3)
 
-    def call(self, method, path, payload=None, token=None, content_type="application/json"):
+    def call(self, method, path, payload=None, token=None, content_type="application/json", extra_headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=3)
         headers = {"Content-Type": content_type}
+        headers.update(extra_headers or {})
         if token is not None:
             headers["Authorization"] = "Bearer " + token
         body = None if payload is None else json.dumps(payload)
@@ -198,6 +199,74 @@ class NativeAPIContractTests(unittest.TestCase):
         )
         self.assertIsNone(no_eval["timing"]["evaluation_wall_s"])
         self.assertIsNone(no_eval["evaluation"])
+
+
+    def test_async_job_creation_disabled_by_default(self):
+        token = "X" * 40
+        with patch.object(api_server, "TOKEN", token):
+            status, _ = self.call("POST", "/api/v1/evaluation-jobs", {
+                "question": "Role of AMF?", "mode": "three_way"
+            }, token=token)
+        self.assertEqual(status, 503)
+
+    def test_async_job_create_is_durable_enqueue_not_paid_inference(self):
+        import async_evaluation
+        token = "X" * 40
+        job = {"ok": True, "job_id": "1" * 32, "capability": "2" * 64, "status": "queued"}
+        with patch.object(api_server, "TOKEN", token), \
+             patch.object(async_evaluation, "enabled", return_value=True), \
+             patch.object(async_evaluation, "start_job", return_value=job) as create, \
+             patch.object(api_server, "run_three_systems") as engine:
+            status, data = self.call("POST", "/api/v1/evaluation-jobs", {
+                "question": "Role of AMF?", "mode": "three_way"
+            }, token=token)
+        self.assertEqual(status, 202)
+        self.assertEqual(data, job)
+        create.assert_called_once_with("Role of AMF?")
+        engine.assert_not_called()
+
+    def test_async_job_status_requires_bearer_and_capability(self):
+        import async_evaluation
+        token = "X" * 40
+        with patch.object(api_server, "TOKEN", token), \
+             patch.object(async_evaluation, "job_status", return_value={
+                 "ok": True, "status": "running", "result": None,
+             }) as status_reader:
+            status, _ = self.call("GET", "/api/v1/evaluation-jobs/" + "a"*32)
+            self.assertEqual(status, 401)
+            status, data = self.call("GET", "/api/v1/evaluation-jobs/" + "a"*32,
+                                     token=token, extra_headers={"X-Job-Capability": "b"*64})
+            self.assertEqual(status, 200)
+            self.assertEqual(data["status"], "running")
+            status_reader.assert_called_once_with("a"*32, "b"*64)
+
+    def test_async_task_rejects_unverified_oidc_without_running(self):
+        import async_evaluation
+        with patch.object(async_evaluation, "enabled", return_value=True), \
+             patch.object(async_evaluation, "verify_task_oidc", return_value=False), \
+             patch.object(async_evaluation, "run_job") as worker:
+            status, _ = self.call("POST", "/api/v1/internal/evaluation-run", {
+                "job_id": "a"*32
+            })
+            self.assertEqual(status, 401)
+            worker.assert_not_called()
+
+    def test_async_task_runs_original_pipeline_once_when_verified_and_ready(self):
+        import async_evaluation
+        with patch.object(api_server, "ready", True), \
+             patch.object(api_server, "ENABLED", True), \
+             patch.object(api_server, "TOKEN", "X"*40), \
+             patch.object(async_evaluation, "enabled", return_value=True), \
+             patch.object(async_evaluation, "verify_task_oidc", return_value=True), \
+             patch.object(async_evaluation, "run_job", return_value={
+                 "ok": True, "status": "completed"
+             }) as worker:
+            status, data = self.call("POST", "/api/v1/internal/evaluation-run", {
+                "job_id": "a"*32
+            })
+            self.assertEqual(status, 200)
+            self.assertEqual(data["status"], "completed")
+            worker.assert_called_once_with("a"*32, api_server.run_three_systems)
 
     def test_question_length_guard(self):
         for invalid in ("", "a", "x" * 501, None):
