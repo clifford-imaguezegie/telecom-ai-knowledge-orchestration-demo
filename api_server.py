@@ -102,16 +102,32 @@ async def stream_three_systems(question:str,include_evaluation:bool,send):
     from api_adapter import public_path,safe_evaluation
     started=time.perf_counter()
     pending=asyncio.Queue()
+    event_loop=asyncio.get_running_loop()
     def observe_path(key,raw):
-        # Callback runs in the original comparison event loop, not a provider thread.
-        pending.put_nowait((key,raw))
-    send("accepted",{"ok":True,"evaluation_requested":include_evaluation})
+        # Full-answer callback runs in the original comparison event loop.
+        pending.put_nowait(("path_complete",key,raw))
+    def observe_token(key,delta):
+        # SDK token callbacks run in existing model worker threads.
+        # Schedule into this one asyncio event loop; never write to HTTP
+        # response streams from the provider threads.
+        if not delta or key not in ("llm_only","strict","augmented"):
+            return
+        for offset in range(0,len(delta),512):
+            part=delta[offset:offset+512]
+            event_loop.call_soon_threadsafe(
+                pending.put_nowait,("answer_delta",key,part))
+    send("accepted",{"ok":True,"evaluation_requested":include_evaluation,
+                     "token_streaming":True})
     run_task=asyncio.create_task(
-        run_three_path_experiment(question,on_path=observe_path))
+        run_three_path_experiment(question,on_path=observe_path,
+                                  on_token=observe_token))
     while not run_task.done() or not pending.empty():
         try:
-            key,raw=await asyncio.wait_for(pending.get(),timeout=3.0)
-            send("path_complete",{"key":key,"path":public_path(raw,key)})
+            event,key,payload=await asyncio.wait_for(pending.get(),timeout=3.0)
+            if event=="answer_delta":
+                send("answer_delta",{"key":key,"text":payload})
+            else:
+                send("path_complete",{"key":key,"path":public_path(payload,key)})
         except asyncio.TimeoutError:
             send("heartbeat",{"phase":"reasoning"})
     r=await run_task
