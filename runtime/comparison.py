@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Any
+from typing import Any, Callable
 
 from runtime.orchestrator import (
     TELECOM_GROUNDED_MODE,
@@ -289,8 +289,38 @@ async def _run_augmented_path(
     )
 
 
+def _notify_completed_path(task, key, started, metadata, on_path):
+    """Nonintrusive task completion observer for native SSE.
+
+    Called by asyncio only after the ORIGINAL inference task finishes. An
+    observer failure must never affect or repeat the real experiment.
+    """
+    if task.cancelled() or task.exception() is not None:
+        return
+    try:
+        value=task.result()
+        elapsed=float(time.perf_counter()-started)
+        raw={
+            "metadata":metadata,
+            "result":value,
+            "timing":{"total_wall_s":elapsed},
+            "orchestration_path":(
+                [{"stage":"Gemma LLM-Only Inference",
+                  "status":"completed","elapsed_s":elapsed}]
+                if key=="llm_only"
+                else value.get("orchestration_path",[])
+                if isinstance(value,dict) else []
+            ),
+        }
+        on_path(key,raw)
+    except Exception:
+        # UI observability must never change inference, routing or scoring.
+        pass
+
+
 async def run_three_path_experiment(
     question: str,
+    on_path: Callable[[str,dict[str,Any]],None] | None = None,
 ) -> dict[str, Any]:
     security = preprocess_user_prompt(
         question
@@ -321,6 +351,12 @@ async def run_three_path_experiment(
             sanitized,
         )
     )
+    if on_path is not None:
+        baseline_task.add_done_callback(
+            lambda task: _notify_completed_path(
+                task,"llm_only",baseline_started,_llm_only_path_metadata(),on_path
+            )
+        )
 
     router_started = time.perf_counter()
 
@@ -358,6 +394,17 @@ async def run_three_path_experiment(
             sanitized,
         )
     )
+    if on_path is not None:
+        strict_task.add_done_callback(
+            lambda task: _notify_completed_path(
+                task,"strict",strict_started,_strict_path_metadata(response_mode),on_path
+            )
+        )
+        augmented_task.add_done_callback(
+            lambda task: _notify_completed_path(
+                task,"augmented",augmented_started,_augmented_path_metadata(response_mode),on_path
+            )
+        )
 
     baseline_result = await baseline_task
 
