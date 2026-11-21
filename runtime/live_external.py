@@ -528,6 +528,7 @@ def run_live_external_grounded_generation_4c6w(
             },
         ],
         max_tokens=900,
+        stream_final=True,
     )
 
     elapsed = time.perf_counter() - start

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from typing import Any, Callable
+from runtime.token_stream import output_tokens_for
 
 from runtime.orchestrator import (
     TELECOM_GROUNDED_MODE,
@@ -318,9 +319,22 @@ def _notify_completed_path(task, key, started, metadata, on_path):
         pass
 
 
+def _baseline_with_tokens(sanitized: str, observer):
+    with output_tokens_for("llm_only", observer):
+        return generate_gemma_only_baseline(sanitized)
+
+
+async def _routed_path_with_tokens(path, mode, sanitized, observer):
+    with output_tokens_for(path, observer):
+        if path == "strict":
+            return await _run_strict_path(mode, sanitized)
+        return await _run_augmented_path(mode, sanitized)
+
+
 async def run_three_path_experiment(
     question: str,
     on_path: Callable[[str,dict[str,Any]],None] | None = None,
+    on_token: Callable[[str,str],None] | None = None,
 ) -> dict[str, Any]:
     security = preprocess_user_prompt(
         question
@@ -347,8 +361,9 @@ async def run_three_path_experiment(
 
     baseline_task = asyncio.create_task(
         asyncio.to_thread(
-            generate_gemma_only_baseline,
+            _baseline_with_tokens,
             sanitized,
+            on_token,
         )
     )
     if on_path is not None:
@@ -381,17 +396,16 @@ async def run_three_path_experiment(
 
     strict_started = time.perf_counter()
     strict_task = asyncio.create_task(
-        _run_strict_path(
-            response_mode,
-            sanitized,
+        _routed_path_with_tokens(
+            "strict", response_mode, sanitized,
+            on_token if response_mode != GENERAL_KNOWLEDGE_FALLBACK_MODE else None,
         )
     )
 
     augmented_started = time.perf_counter()
     augmented_task = asyncio.create_task(
-        _run_augmented_path(
-            response_mode,
-            sanitized,
+        _routed_path_with_tokens(
+            "augmented", response_mode, sanitized, on_token,
         )
     )
     if on_path is not None:

@@ -9,6 +9,7 @@ import time
 from typing import Any
 
 from openai import OpenAI
+from runtime.token_stream import final_answer_completion
 
 from runtime.config import (
     OPENROUTER_API_KEY,
@@ -829,8 +830,8 @@ def run_augmented_synthesis(
     started = time.perf_counter()
 
     response = (
-        _get_client()
-        .chat.completions.create(
+        final_answer_completion(
+            _get_client(),
             model=GENERATOR_MODEL,
             messages=[
                 {
@@ -1266,8 +1267,8 @@ Rules:
     started = time.perf_counter()
 
     response = (
-        _get_client()
-        .chat.completions.create(
+        final_answer_completion(
+            _get_client(),
             model=GENERATOR_MODEL,
             messages=[
                 {
