@@ -114,8 +114,18 @@ async def stream_three_systems(question:str,include_evaluation:bool,send):
             return
         for offset in range(0,len(delta),512):
             part=delta[offset:offset+512]
-            event_loop.call_soon_threadsafe(
-                pending.put_nowait,("answer_delta",key,part))
+            try:
+                current_loop=asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop=None
+            if current_loop is event_loop:
+                # Tests or future native async providers already on this loop:
+                # preserve token-before-path order synchronously.
+                pending.put_nowait(("answer_delta",key,part))
+            else:
+                # Original OpenAI client executes inside asyncio.to_thread.
+                event_loop.call_soon_threadsafe(
+                    pending.put_nowait,("answer_delta",key,part))
     send("accepted",{"ok":True,"evaluation_requested":include_evaluation,
                      "token_streaming":True})
     run_task=asyncio.create_task(
