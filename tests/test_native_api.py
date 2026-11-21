@@ -2,6 +2,9 @@
 import http.client
 import json
 import threading
+import sys
+import types
+import time
 import unittest
 from unittest.mock import patch
 
@@ -150,6 +153,51 @@ class NativeAPIContractTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_CORPUS_CONTENT", str(data))
         self.assertNotIn("PRIVATE_PASSAGE", str(data))
         self.assertNotIn("/secret/", str(data))
+
+
+    def test_full_api_timing_includes_optional_granite_evaluation(self):
+        # Replaces the heavy original model modules with isolated stubs.
+        compare = types.ModuleType("runtime.comparison")
+        judges = types.ModuleType("runtime.evaluation_threeway")
+
+        async def fake_three_paths(question):
+            return {
+                "sanitized_question": question,
+                "query_type": "TELECOM_GROUNDED",
+                "timing": {"total_wall_s": 2.0},
+                "paths": {
+                    key: {"result": {"answer": "Answer " + key},
+                          "timing": {"total_wall_s": 1.0}}
+                    for key in ("llm_only", "strict", "augmented")
+                },
+            }
+
+        def fake_granite_evaluation(**kwargs):
+            time.sleep(0.01)
+            return {"applicable": True, "systems": {}}
+
+        compare.run_three_path_experiment = fake_three_paths
+        judges.evaluate_three_way_telecom = fake_granite_evaluation
+        judges.run_three_way_quality_judge = lambda *a, **k: {}
+
+        with patch.dict(sys.modules, {
+            "runtime.comparison": compare,
+            "runtime.evaluation_threeway": judges,
+        }):
+            result = api_server.run_three_systems("Role of AMF?", True)
+            no_eval = api_server.run_three_systems("Role of AMF?", False)
+
+        timing = result["timing"]
+        self.assertEqual(timing["total_wall_s"], 2.0)  # unchanged engine contract
+        self.assertGreater(timing["evaluation_wall_s"], 0)
+        self.assertGreaterEqual(
+            timing["api_total_wall_s"], timing["evaluation_wall_s"]
+        )
+        self.assertGreaterEqual(
+            timing["api_total_wall_s"], timing["three_path_api_wall_s"]
+        )
+        self.assertIsNone(no_eval["timing"]["evaluation_wall_s"])
+        self.assertIsNone(no_eval["evaluation"])
 
     def test_question_length_guard(self):
         for invalid in ("", "a", "x" * 501, None):
