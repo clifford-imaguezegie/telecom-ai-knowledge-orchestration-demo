@@ -244,8 +244,10 @@ class NativeAPIContractTests(unittest.TestCase):
                 paths[key]=raw
                 await asyncio.sleep(0.01)
                 if on_token is not None:
-                    on_token(key,"Answered ")
-                    on_token(key,key)
+                    # Simulate the real OpenAI SDK yielding token fragments
+                    # from a worker thread, not the comparison event loop.
+                    await asyncio.to_thread(on_token,key,"Answered ")
+                    await asyncio.to_thread(on_token,key,key)
                 on_path(key,raw)
             return {"question":question,"sanitized_question":question,
                     "query_type":"TELECOM_GROUNDED","paths":paths,
