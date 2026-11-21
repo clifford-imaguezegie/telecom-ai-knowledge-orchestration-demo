@@ -232,7 +232,7 @@ class NativeAPIContractTests(unittest.TestCase):
     def test_progressive_events_are_real_bounded_results_not_placeholders(self):
         compare=types.ModuleType("runtime.comparison")
         judges=types.ModuleType("runtime.evaluation_threeway")
-        async def fake_paths(question,on_path=None):
+        async def fake_paths(question,on_path=None,on_token=None):
             paths={}
             for key in ("strict","llm_only","augmented"):
                 raw={"metadata":{"name":key,"sources":["3GPP"]},
@@ -243,6 +243,9 @@ class NativeAPIContractTests(unittest.TestCase):
                      "timing":{"total_wall_s":1.5}}
                 paths[key]=raw
                 await asyncio.sleep(0.01)
+                if on_token is not None:
+                    on_token(key,"Answered ")
+                    on_token(key,key)
                 on_path(key,raw)
             return {"question":question,"sanitized_question":question,
                     "query_type":"TELECOM_GROUNDED","paths":paths,
@@ -261,6 +264,11 @@ class NativeAPIContractTests(unittest.TestCase):
         names=[e[0] for e in events]
         self.assertEqual([name for name in names if name=="path_complete"],
                          ["path_complete"]*3)
+        self.assertEqual(names.count("answer_delta"),6)
+        emitted=[(data["key"],data["text"]) for name,data in events
+                 if name=="answer_delta"]
+        self.assertEqual(emitted[0:2],[("strict","Answered "),("strict","strict")])
+        self.assertLess(names.index("answer_delta"),names.index("path_complete"))
         self.assertEqual([data["key"] for name,data in events if name=="path_complete"],
                          ["strict","llm_only","augmented"])
         self.assertLess(names.index("path_complete"),names.index("evaluation_started"))
