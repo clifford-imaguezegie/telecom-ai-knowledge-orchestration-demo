@@ -8,6 +8,7 @@ import time
 from typing import Any
 
 from openai import OpenAI
+from runtime.token_stream import final_answer_completion
 
 from runtime.config import (
     GENERATOR_MODEL,
@@ -271,13 +272,15 @@ def _4c6w_usage(response):
     }
 
 
-def _4c6w_call_llm(messages, max_tokens):
+def _4c6w_call_llm(messages, max_tokens, *, stream_final=False):
     request_args = {
         "model": LLM_MODEL,
         "messages": messages,
         "max_tokens": int(max_tokens),
     }
     # Preserve the established provider-default temperature convention.
+    if stream_final:
+        return final_answer_completion(_get_openrouter(), **request_args)
     return _get_openrouter().chat.completions.create(**request_args)
 
 
@@ -839,6 +842,7 @@ def run_4c_telecom_grounded(question, context):
             },
         ],
         max_tokens=MAX_OUTPUT_TOKENS,
+        stream_final=True,
     )
     elapsed = time.perf_counter() - start
 
