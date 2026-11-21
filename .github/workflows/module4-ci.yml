@@ -23,10 +23,13 @@ jobs:
           python-version: "3.11"
 
       - name: Compile Python sources
-        run: python -m compileall -q app.py app runtime api_adapter.py api_server.py tests
+        run: python -m compileall -q app.py app runtime api_adapter.py api_server.py async_evaluation.py tests
 
       - name: Native API security and schema smoke tests (no LLM calls)
         run: python -m unittest discover -s tests -p 'test_native_api.py' -v
+
+      - name: Verify optional durable Granite job safety (no cloud or LLM calls)
+        run: python -m unittest discover -s tests -p 'test_async_evaluation.py' -v
 
       - name: Ensure local secret files are not tracked
         shell: bash
