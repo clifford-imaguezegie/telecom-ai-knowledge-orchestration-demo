@@ -206,7 +206,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 def send_event(name,data):
                     payload=json.dumps(data,ensure_ascii=False,separators=(",",":"))
-                    wire=("event: "+name+"\\n"+"data: "+payload+"\\n\\n").encode("utf-8")
+                    wire=("event: "+name+"\n"+"data: "+payload+"\n\n").encode("utf-8")
                     self.wfile.write(wire)
                     self.wfile.flush()
                 try:
