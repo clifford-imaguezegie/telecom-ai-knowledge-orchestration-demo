@@ -1,5 +1,6 @@
 """Offline native API contract tests; never load FAISS, BGE-M3 or call OpenRouter."""
 import http.client
+import asyncio
 import json
 import threading
 import sys
@@ -198,6 +199,76 @@ class NativeAPIContractTests(unittest.TestCase):
         )
         self.assertIsNone(no_eval["timing"]["evaluation_wall_s"])
         self.assertIsNone(no_eval["evaluation"])
+
+    def test_stream_sse_requires_auth_and_remains_bounded(self):
+        token="X"*40
+        payload={"question":"Role of AMF?","mode":"three_way","include_evaluation":True}
+        async def fake_stream(question,wants_eval,emit):
+            self.assertEqual(question,"Role of AMF?")
+            self.assertTrue(wants_eval)
+            emit("accepted",{"ok":True})
+            emit("evaluation_started",{"ok":True})
+            emit("complete",{"ok":True,"paths":{"strict":{"answer":"real stub"}}})
+        with patch.object(api_server,"ENABLED",True), \
+             patch.object(api_server,"TOKEN",token), \
+             patch.object(api_server,"ready",True), \
+             patch.object(api_server,"stream_three_systems",side_effect=fake_stream):
+            status,_=self.call("POST","/api/v1/stream",payload)
+            self.assertEqual(status,401)
+            conn=http.client.HTTPConnection("127.0.0.1",self.port,timeout=3)
+            conn.request("POST","/api/v1/stream",body=json.dumps(payload),
+                         headers={"Content-Type":"application/json","Authorization":"Bearer "+token})
+            response=conn.getresponse()
+            wire=response.read().decode("utf-8")
+            self.assertEqual(response.status,200)
+            self.assertIn("text/event-stream",response.getheader("Content-Type"))
+            self.assertIn("event: accepted\\n",wire)
+            self.assertIn("event: evaluation_started\\n",wire)
+            self.assertIn("event: complete\\n",wire)
+            self.assertLess(wire.index("event: accepted"),wire.index("event: evaluation_started"))
+            self.assertLess(wire.index("event: evaluation_started"),wire.index("event: complete"))
+            conn.close()
+
+    def test_progressive_events_are_real_bounded_results_not_placeholders(self):
+        compare=types.ModuleType("runtime.comparison")
+        judges=types.ModuleType("runtime.evaluation_threeway")
+        async def fake_paths(question,on_path=None):
+            paths={}
+            for key in ("strict","llm_only","augmented"):
+                raw={"metadata":{"name":key,"sources":["3GPP"]},
+                     "result":{"answer":"Answered "+key,
+                               "final_context":"PRIVATE_PASSAGE",
+                               "final_evidence":[{"title":"3GPP","source_family":"3GPP",
+                                                  "text":"PRIVATE_CORPUS_CONTENT"}]},
+                     "timing":{"total_wall_s":1.5}}
+                paths[key]=raw
+                await asyncio.sleep(0.01)
+                on_path(key,raw)
+            return {"question":question,"sanitized_question":question,
+                    "query_type":"TELECOM_GROUNDED","paths":paths,
+                    "timing":{"total_wall_s":0.03}}
+        def fake_granite_evaluation(**kwargs):
+            time.sleep(0.01)
+            return {"applicable":True,"systems":{"llm_only":{"relevance_score":88}}}
+        compare.run_three_path_experiment=fake_paths
+        judges.evaluate_three_way_telecom=fake_granite_evaluation
+        judges.run_three_way_quality_judge=lambda *args,**kwargs: {}
+        events=[]
+        with patch.dict(sys.modules,{"runtime.comparison":compare,
+                                      "runtime.evaluation_threeway":judges}):
+            asyncio.run(api_server.stream_three_systems(
+                "Role of AMF?",True,lambda name,data:events.append((name,data))))
+        names=[e[0] for e in events]
+        self.assertEqual([name for name in names if name=="path_complete"],
+                         ["path_complete"]*3)
+        self.assertEqual([data["key"] for name,data in events if name=="path_complete"],
+                         ["strict","llm_only","augmented"])
+        self.assertLess(names.index("path_complete"),names.index("evaluation_started"))
+        self.assertLess(names.index("evaluation_started"),names.index("evaluation_complete"))
+        self.assertLess(names.index("evaluation_complete"),names.index("complete"))
+        self.assertEqual(events[-1][1]["evaluation"]["systems"]["llm_only"]["relevance_score"],88.0)
+        self.assertNotIn("PRIVATE_PASSAGE",str(events))
+        self.assertNotIn("PRIVATE_CORPUS_CONTENT",str(events))
 
     def test_question_length_guard(self):
         for invalid in ("", "a", "x" * 501, None):
