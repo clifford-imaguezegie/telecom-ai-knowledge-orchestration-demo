@@ -113,6 +113,22 @@ class Handler(BaseHTTPRequestHandler):
         try:self.wfile.write(body)
         except (BrokenPipeError,ConnectionResetError):pass
     def do_GET(self):
+        if self.path.startswith("/api/v1/evaluation-jobs/"):
+            if len(TOKEN)<32 or not hmac.compare_digest(
+                self.headers.get("Authorization",""),"Bearer "+TOKEN):
+                return self.reply(401,{"ok":False,"error":"Unauthorised"})
+            from async_evaluation import JobNotFound,JobUnavailable,job_status
+            job_id=self.path[len("/api/v1/evaluation-jobs/"):]
+            try:
+                data=job_status(job_id,self.headers.get("X-Job-Capability",""))
+                return self.reply(200,data)
+            except JobNotFound:
+                return self.reply(404,{"ok":False,"error":"Evaluation job not found"})
+            except JobUnavailable:
+                return self.reply(503,{"ok":False,"error":"Asynchronous evaluation is not configured"})
+            except Exception:
+                logging.exception("Evaluation job status unavailable")
+                return self.reply(503,{"ok":False,"error":"Evaluation job status unavailable"})
         if self.path=="/healthz":
             return self.reply(200,{"ok":True,"service":"telecom-rag-api"})
         if self.path=="/api/v1/ready":
@@ -121,11 +137,62 @@ class Handler(BaseHTTPRequestHandler):
                               {"Retry-After":"20"} if not is_ready() else None)
         return self.reply(404,{"ok":False,"error":"Not found"})
     def do_POST(self):
-        if self.path!="/api/v1/answer":
+        if self.path=="/api/v1/internal/evaluation-run":
+            from async_evaluation import enabled,verify_task_oidc,run_job
+            if not enabled():
+                return self.reply(503,{"ok":False,"error":"Evaluation jobs disabled"})
+            if not verify_task_oidc(self.headers.get("Authorization","")):
+                return self.reply(401,{"ok":False,"error":"Cloud Tasks identity rejected"})
+            if not is_ready():
+                return self.reply(503,{"ok":False,"error":"Original RAG engine warming"},
+                                  {"Retry-After":"20"})
+            try:
+                length=int(self.headers.get("Content-Length") or "0")
+                if length<=0 or length>200:
+                    raise ValueError("invalid task body")
+                body=json.loads(self.rfile.read(length))
+                if not isinstance(body,dict) or set(body)!={"job_id"}:
+                    raise ValueError("invalid job")
+                job_id=body["job_id"]
+            except (ValueError,TypeError,UnicodeDecodeError):
+                return self.reply(400,{"ok":False,"error":"Invalid job"})
+            if not single.acquire(blocking=False):
+                return self.reply(429,{"ok":False,"error":"Original experiment busy"},
+                                  {"Retry-After":"15"})
+            try:
+                return self.reply(200,run_job(job_id,run_three_systems))
+            except Exception:
+                logging.exception("Evaluation job runner unavailable")
+                return self.reply(503,{"ok":False,"error":"Evaluation job runner unavailable"})
+            finally:
+                single.release()
+        if self.path not in ("/api/v1/answer","/api/v1/evaluation-jobs"):
             return self.reply(404,{"ok":False,"error":"Not found"})
         if len(TOKEN)<32 or not hmac.compare_digest(
             self.headers.get("Authorization",""),"Bearer "+TOKEN):
             return self.reply(401,{"ok":False,"error":"Unauthorised"})
+        if self.path=="/api/v1/evaluation-jobs":
+            from async_evaluation import enabled,start_job,JobUnavailable
+            if not enabled():
+                return self.reply(503,{"ok":False,"error":"Durable evaluation jobs disabled"})
+            try:
+                length=int(self.headers.get("Content-Length") or "0")
+                if length<=0 or length>1800:
+                    return self.reply(413,{"ok":False,"error":"Request too large"})
+                if self.headers.get("Content-Type","").split(";")[0].lower().strip()!="application/json":
+                    return self.reply(415,{"ok":False,"error":"JSON required"})
+                body=json.loads(self.rfile.read(length))
+                if not isinstance(body,dict) or set(body)!={"question","mode"} or body["mode"]!="three_way":
+                    raise ValueError("Invalid evaluation input")
+                question=validate_question(body["question"])
+                return self.reply(202,start_job(question))
+            except (ValueError,TypeError,UnicodeDecodeError,KeyError):
+                return self.reply(400,{"ok":False,"error":"Invalid evaluation question"})
+            except JobUnavailable:
+                return self.reply(503,{"ok":False,"error":"Durable evaluation is unavailable"})
+            except Exception:
+                logging.exception("Could not submit evaluation job")
+                return self.reply(503,{"ok":False,"error":"Evaluation job could not be queued"})
         if not is_ready():
             return self.reply(503,{"ok":False,"error":"Original RAG engine is warming or unavailable"},
                               {"Retry-After":"20"})

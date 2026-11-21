@@ -11,3 +11,8 @@ kagglehub
 duckdb
 fastmcp
 huggingface_hub
+
+# Optional durable Granite evaluation jobs (not enabled for Streamlit)
+google-cloud-firestore>=2.20,<3
+google-cloud-tasks>=2.19,<3
+google-auth>=2.38,<3
