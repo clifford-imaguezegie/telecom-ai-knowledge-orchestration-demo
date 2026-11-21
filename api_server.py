@@ -41,9 +41,42 @@ def prewarm():
         logging.exception("RAG prewarming failed; API remains unavailable")
 
 
+def evaluate_completed_original(r:dict,question:str):
+    """Original Granite judge, invoked only after all three paths finish."""
+    from runtime.evaluation_threeway import (
+        evaluate_three_way_telecom,run_three_way_quality_judge)
+    paths=r["paths"]
+    result=lambda key:paths[key]["result"] or {}
+    answer=lambda key:str(result(key).get("answer") or "")
+    q=r.get("sanitized_question") or question
+    if r.get("query_type")=="TELECOM_GROUNDED":
+        strict=result("strict");aug=result("augmented")
+        return evaluate_three_way_telecom(
+            question=q,
+            llm_only_answer=answer("llm_only"),
+            strict_answer=answer("strict"),
+            augmented_answer=answer("augmented"),
+            strict_evidence_context=strict.get("final_context") or "",
+            strict_evidence_items=strict.get("final_evidence") or [],
+            augmented_evidence_context=aug.get("final_context") or "",
+            augmented_evidence_items=aug.get("final_evidence") or [],
+        )
+    v=run_three_way_quality_judge(
+        q,answer("llm_only"),answer("strict"),answer("augmented"))["payload"]
+    return {"applicable":False,
+        "systems":{key:{
+            "relevance_score":v[answer_key].get("relevance_score"),
+            "completeness_score":v[answer_key].get("completeness_score"),
+            "hallucination_risk_pct":None,
+            "hallucination_risk_label":"N/A"
+        } for key,answer_key in (
+            ("llm_only","answer_a"),("strict","answer_b"),("augmented","answer_c"))},
+        "comparison_summary":v.get("comparison_summary"),
+        "question_intent":v.get("question_intent")}
+
+
 def run_three_systems(question:str,include_evaluation:bool):
-    # The original comparison timing does NOT include the optional Granite judges.
-    # Measure the entire API experiment separately without altering the engine.
+    # Backward-compatible original synchronous JSON route.
     started=time.perf_counter()
     from runtime.comparison import run_three_path_experiment
     r=asyncio.run(run_three_path_experiment(question))
@@ -52,39 +85,7 @@ def run_three_systems(question:str,include_evaluation:bool):
     evaluation_s=None
     if include_evaluation:
         evaluation_started=time.perf_counter()
-        from runtime.evaluation_threeway import (
-            evaluate_three_way_telecom,run_three_way_quality_judge)
-        paths=r["paths"]
-        result=lambda key:paths[key]["result"] or {}
-        answer=lambda key:str(result(key).get("answer") or "")
-        q=r.get("sanitized_question") or question
-        if r.get("query_type")=="TELECOM_GROUNDED":
-            strict=result("strict");aug=result("augmented")
-            evaluation=evaluate_three_way_telecom(
-                question=q,
-                llm_only_answer=answer("llm_only"),
-                strict_answer=answer("strict"),
-                augmented_answer=answer("augmented"),
-                strict_evidence_context=strict.get("final_context") or "",
-                strict_evidence_items=strict.get("final_evidence") or [],
-                augmented_evidence_context=aug.get("final_context") or "",
-                augmented_evidence_items=aug.get("final_evidence") or [],
-            )
-        else:
-            # No corpus hallucination-risk assessment outside telecom knowledge scope.
-            v=run_three_way_quality_judge(
-                q,answer("llm_only"),answer("strict"),answer("augmented"))["payload"]
-            evaluation={"applicable":False,
-                "systems":{key:{
-                    "relevance_score":v[answer_key].get("relevance_score"),
-                    "completeness_score":v[answer_key].get("completeness_score"),
-                    "hallucination_risk_pct":None,
-                    "hallucination_risk_label":"N/A"
-                } for key,answer_key in (
-                    ("llm_only","answer_a"),("strict","answer_b"),("augmented","answer_c"))},
-                "comparison_summary":v.get("comparison_summary"),
-                "question_intent":v.get("question_intent")}
-    if include_evaluation:
+        evaluation=evaluate_completed_original(r,question)
         evaluation_s=round(time.perf_counter()-evaluation_started,3)
     output=public_result(r,evaluation)
     output["timing"].update({
@@ -93,6 +94,55 @@ def run_three_systems(question:str,include_evaluation:bool):
         "evaluation_wall_s":evaluation_s,
     })
     return output
+
+
+async def stream_three_systems(question:str,include_evaluation:bool,send):
+    """Send real path-completion and Granite-stage SSE events; no synthetic answers."""
+    from runtime.comparison import run_three_path_experiment
+    from api_adapter import public_path,safe_evaluation
+    started=time.perf_counter()
+    pending=asyncio.Queue()
+    def observe_path(key,raw):
+        # Callback runs in the original comparison event loop, not a provider thread.
+        pending.put_nowait((key,raw))
+    send("accepted",{"ok":True,"evaluation_requested":include_evaluation})
+    run_task=asyncio.create_task(
+        run_three_path_experiment(question,on_path=observe_path))
+    while not run_task.done() or not pending.empty():
+        try:
+            key,raw=await asyncio.wait_for(pending.get(),timeout=3.0)
+            send("path_complete",{"key":key,"path":public_path(raw,key)})
+        except asyncio.TimeoutError:
+            send("heartbeat",{"phase":"reasoning"})
+    r=await run_task
+    three_path_s=round(time.perf_counter()-started,3)
+    evaluation=None
+    evaluation_s=None
+    if include_evaluation:
+        send("evaluation_started",{"ok":True})
+        judge_started=time.perf_counter()
+        judge_task=asyncio.create_task(
+            asyncio.to_thread(evaluate_completed_original,r,question))
+        while not judge_task.done():
+            await asyncio.sleep(3)
+            if not judge_task.done():
+                send("heartbeat",{"phase":"evaluation"})
+        try:
+            evaluation=await judge_task
+        except Exception:
+            logging.exception("Original Granite judge failed; keeping completed answers")
+            send("evaluation_failed",{"ok":False,"error":"Granite assessment unavailable; the three original answers remain available."})
+        evaluation_s=round(time.perf_counter()-judge_started,3)
+        if evaluation is not None:
+            send("evaluation_complete",{"ok":True,"evaluation":safe_evaluation(evaluation),
+                                        "elapsed_s":evaluation_s})
+    output=public_result(r,evaluation)
+    output["timing"].update({
+        "api_total_wall_s":round(time.perf_counter()-started,3),
+        "three_path_api_wall_s":three_path_s,
+        "evaluation_wall_s":evaluation_s,
+    })
+    send("complete",output)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -121,7 +171,8 @@ class Handler(BaseHTTPRequestHandler):
                               {"Retry-After":"20"} if not is_ready() else None)
         return self.reply(404,{"ok":False,"error":"Not found"})
     def do_POST(self):
-        if self.path!="/api/v1/answer":
+        streaming=self.path=="/api/v1/stream"
+        if self.path!="/api/v1/answer" and not streaming:
             return self.reply(404,{"ok":False,"error":"Not found"})
         if len(TOKEN)<32 or not hmac.compare_digest(
             self.headers.get("Authorization",""),"Bearer "+TOKEN):
@@ -146,6 +197,27 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(429,{"ok":False,"error":"The original engine is processing another question"},
                               {"Retry-After":"15"})
         try:
+            if streaming:
+                self.send_response(200)
+                self.send_header("Content-Type","text/event-stream; charset=utf-8")
+                self.send_header("Cache-Control","no-cache, no-store")
+                self.send_header("X-Content-Type-Options","nosniff")
+                self.send_header("X-Accel-Buffering","no")
+                self.end_headers()
+                def send_event(name,data):
+                    payload=json.dumps(data,ensure_ascii=False,separators=(",",":"))
+                    wire=("event: "+name+"\\n"+"data: "+payload+"\\n\\n").encode("utf-8")
+                    self.wfile.write(wire)
+                    self.wfile.flush()
+                try:
+                    asyncio.run(stream_three_systems(question,d["include_evaluation"],send_event))
+                except (BrokenPipeError,ConnectionResetError):
+                    logging.info("RAG streaming client disconnected")
+                except Exception:
+                    logging.exception("RAG streaming experiment execution failed")
+                    try:send_event("error",{"ok":False,"error":"Original telecom experiment could not complete"})
+                    except (BrokenPipeError,ConnectionResetError):pass
+                return
             return self.reply(200,run_three_systems(question,d["include_evaluation"]))
         except Exception:
             logging.exception("Three-system experiment execution failed")
