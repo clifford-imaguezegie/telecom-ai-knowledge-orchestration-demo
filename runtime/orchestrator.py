@@ -19,6 +19,7 @@ from runtime.config import (
     MAX_OUTPUT_TOKENS,
     DEFAULT_TIMEZONE,
 )
+from runtime.token_stream import final_answer_completion
 from runtime.adaptive import run_connected_corpus_grounded
 from runtime.live_external import run_live_external_grounded_4c6w
 
@@ -243,7 +244,7 @@ def preprocess_user_prompt(prompt: str) -> dict[str, Any]:
 
 def generate_gemma_only_baseline(question: str) -> dict[str, Any]:
     start = time.perf_counter()
-    response = _client().chat.completions.create(
+    response = final_answer_completion(_client(),
         model=GENERATOR_MODEL,
         messages=[
             {
@@ -272,7 +273,7 @@ def generate_gemma_only_baseline(question: str) -> dict[str, Any]:
 
 def generate_general_fallback(question: str) -> dict[str, Any]:
     start = time.perf_counter()
-    response = _client().chat.completions.create(
+    response = final_answer_completion(_client(),
         model=GENERATOR_MODEL,
         messages=[
             {
